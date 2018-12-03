@@ -1,0 +1,7 @@
+(define (emit-program x)
+  (unless (integer? x) (error ---))
+  (emit "    .text")
+  (emit "    .global scheme_entry")
+  (emit "scheme_entry:")
+  (emit "    movl $~s, %eax" x)
+  (emit "    ret"))

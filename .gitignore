@@ -1,0 +1,4 @@
+*.tgz
+
+/tests
+/stst*
