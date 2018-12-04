@@ -29,7 +29,7 @@
   (emit "    ret")
 
   (emit-label "L_scheme_entry")
-  (emit-expr (- wordsize) expr)
+  (emit-expr (- wordsize) '() expr)
   (emit "    ret"))
 
 (define (emit-function-header funcname)
@@ -37,43 +37,47 @@
   (emit (string-append "    .global " funcname))
   (emit (string-append funcname ":")))
 
-(define (emit-expr si expr)
+(define (emit-expr si env expr)
   (cond
    ((immediate? expr) (emit-immediate expr))
-   ((if? expr)        (emit-if si expr))
-   ((and? expr)       (emit-and si expr))
-   ((or? expr)        (emit-or si expr))
-   ((primcall? expr)  (emit-primcall si expr))
-   ((predicate-call? expr) (emit-predicate-val si expr))
+   ((variable? expr)  (emit-variable-ref env expr))
+   ((if? expr)        (emit-if si env expr))
+   ((and? expr)       (emit-and si env expr))
+   ((or? expr)        (emit-or si env expr))
+   ((let? expr)       (emit-let si env expr))
+   ((primcall? expr)  (emit-primcall si env expr))
+   ((predicate-call? expr) (emit-predicate-val si env expr))
    (else (error "not implemented"))))
 
 (define (emit-immediate x)
   (emit "    movl $~s, %eax" (immediate-rep x)))
 
-(define (emit-primcall si expr)
-  (let ((prim (car expr)) (args (cdr expr)))
+(define (emit-primcall si env expr)
+  (let ((prim (car expr))
+		(args (cdr expr)))
     (check-primcall-args prim args)
-    (apply (primitive-emitter prim) si args)))
+    (apply (primitive-emitter prim) si env args)))
 
-(define (emit-predicate-val si expr)
-  (let ((c (emit-predicate-test si expr))
+(define (emit-predicate-val si env expr)
+  (let ((c (emit-predicate-test si env expr))
         (prim (car expr))
         (args (cdr expr)))
     (emit-to-boolean c)))
 
-(define (emit-predicate-test si expr)
-  (let ((prim (car expr)) (args (cdr expr)))
+(define (emit-predicate-test si env expr)
+  (let ((prim (car expr))
+        (args (cdr expr)))
     (check-primcall-args prim args)
-    (apply (predicate-emitter prim) si args)))
+    (apply (predicate-emitter prim) si env args)))
 
 (define (emit-label label)
   (emit "~a:" label))
 
-(define (emit-test si expr)
+(define (emit-test si env expr)
   (if (predicate-call? expr)
-      (emit-predicate-test si expr)
+      (emit-predicate-test si env expr)
     (begin
-      (emit-expr si expr)
+      (emit-expr si env expr)
       (emit "    cmp $~s, %al" bool_f)
       'NEQ)))
 
@@ -88,25 +92,25 @@
              (else (error "illegal condition")))))
     (emit "    ~a ~a" c label)))
 
-(define (emit-if si expr)
+(define (emit-if si env expr)
   (let ((alt-label (unique-label))
         (end-label (unique-label)))
-    (emit-jump-if-not (emit-test si (if-test expr))
+    (emit-jump-if-not (emit-test si env (if-test expr))
                       alt-label)
-    (emit-expr si (if-conseq expr))
+    (emit-expr si env (if-conseq expr))
     (emit "    jmp ~a" end-label)
     (emit-label alt-label)
-    (emit-expr si (if-altern expr))
+    (emit-expr si env (if-altern expr))
     (emit-label end-label)))
 
-(define (emit-and si expr)
+(define (emit-and si env expr)
   (define (test-false expr false-label end-label)
     (if (predicate-call? expr)
         (begin
-          (emit-predicate-test si expr)
+          (emit-predicate-test si env expr)
           (emit "    jne ~a" false-label))  ; Jump to set #f if condition is failed.
       (begin
-        (emit-test si expr)
+        (emit-test si env expr)
         (emit "    je ~a" end-label))))  ; If expr is value (not predicate), the value is #f when failed, so jump to the end directly.
   (let ((p (cdr expr)))
     (cond ((null? p)
@@ -116,7 +120,7 @@
                  (end-label (unique-label)))
              (let loop ((p p))
                (if (null? (cdr p)) ; Last
-                   (emit-expr si (car p))
+                   (emit-expr si env (car p))
                  (begin
                    (test-false (car p) false-label end-label)
                    (loop (cdr p)))))
@@ -125,14 +129,14 @@
              (emit "    mov $~s, %eax" bool_f)
              (emit-label end-label))))))
 
-(define (emit-or si expr)
+(define (emit-or si env expr)
   (define (test-true expr true-label end-label)
     (if (predicate-call? expr)
         (begin
-          (emit-predicate-test si expr)
+          (emit-predicate-test si env expr)
           (emit "    je ~a" true-label))  ; Jump to set #t if condition is succeeded.
       (begin
-        (emit-test si expr)
+        (emit-test si env expr)
         (emit "    jne ~a" end-label))))  ; If expr is value (not predicate), the value is non-falsy, so jump to the end directly.
   (let ((p (cdr expr)))
     (cond ((null? p)
@@ -142,7 +146,7 @@
                  (end-label (unique-label)))
              (let loop ((p p))
                (if (null? (cdr p))
-                   (emit-expr si (car p))
+                   (emit-expr si env (car p))
                  (begin
                    (test-true (car p) true-label end-label)
                    (loop (cdr p)))))
@@ -150,6 +154,58 @@
              (emit-label true-label)
              (emit "    mov $~s, %eax" bool_t)
              (emit-label end-label))))))
+
+(define (emit-let si env expr)
+  (define (process-let bindings si new-env)
+    (cond
+     ((empty? bindings)
+      (emit-expr si new-env (let-body expr)))
+     (else
+      (let ((b (first bindings)))
+        (emit-expr si env (rhs b))
+        (emit-stack-save si)
+        (process-let (rest bindings)
+                     (next-stack-index si)
+                     (extend-env (lhs b) si new-env))))))
+  (process-let (let-bindings expr) si env))
+
+(define (emit-stack-save si)
+  (emit "    movl %eax, ~s(%esp)" si))
+
+(define (emit-stack-load si)
+  (emit "    movl ~s(%esp), %eax" si))
+
+(define (emit-variable-ref env var)
+  (cond
+   ((lookup var env) => emit-stack-load)
+   (else (error "unbound variable: " var))))
+
+(define (let? expr)
+  (and (pair? expr) (eq? (car expr) 'let)))
+
+(define (let-bindings expr)
+  (cadr expr))
+
+(define (let-body expr)
+  (caddr expr))
+
+(define empty? null?)
+(define first car)
+(define rest cdr)
+(define lhs car)
+(define rhs cadr)
+(define (next-stack-index si) (- si wordsize))
+(define (variable? x)
+  (symbol? x))
+
+(define (extend-env varname si env)
+  (cons (cons varname si) env))
+
+(define (lookup var env)
+  (let ((a (assoc var env)))
+    (if a
+        (cdr a)
+      #f)))
 
 (define (fixnum? x)
   (and (integer? x) (exact? x) (<= fxlower x fxupper)))
@@ -213,29 +269,29 @@
 
 (define-syntax define-primitive
   (syntax-rules ()
-    ((_ (prim-name si arg* ...) b b* ...)
+    ((_ (prim-name si env arg* ...) b b* ...)
      (begin
        (putprop 'prim-name '*is-prim* #t)
        (putprop 'prim-name '*arg-count*
                 (length '(arg* ...)))
        (putprop 'prim-name '*emitter*
-                (lambda (si arg* ...) b b* ...))))))
+                (lambda (si env arg* ...) b b* ...))))))
 
-(define-primitive ($fxadd1 si arg)
-  (emit-expr si arg)
+(define-primitive ($fxadd1 si env arg)
+  (emit-expr si env arg)
   (emit "    addl $~s, %eax" (immediate-rep 1)))
 
-(define-primitive ($fxsub1 si arg)
-  (emit-expr si arg)
+(define-primitive ($fxsub1 si env arg)
+  (emit-expr si env arg)
   (emit "    subl $~s, %eax" (immediate-rep 1)))
 
-(define-primitive ($fixnum->char si arg)
-  (emit-expr si arg)
+(define-primitive ($fixnum->char si env arg)
+  (emit-expr si env arg)
   (emit "    shll $~s, %eax" (- charshift fxshift))
   (emit "    orl $~s, %eax" chartag))
 
-(define-primitive ($char->fixnum si arg)
-  (emit-expr si arg)
+(define-primitive ($char->fixnum si env arg)
+  (emit-expr si env arg)
   (emit "    shrl $~s, %eax" (- charshift fxshift)))
 
 (define (emit-to-boolean c)
@@ -254,135 +310,135 @@
 
 (define-syntax define-predicate
   (syntax-rules ()
-    ((_ (prim-name si arg* ...) b b* ...)
+    ((_ (prim-name si env arg* ...) b b* ...)
      (begin
        (putprop 'prim-name '*is-predicate* #t)
        (putprop 'prim-name '*arg-count*
                 (length '(arg* ...)))
        (putprop 'prim-name '*emitter*
-                (lambda (si arg* ...) b b* ...))))))
+                (lambda (si env arg* ...) b b* ...))))))
 
-(define-predicate (fixnum? si arg)
-  (emit-expr si arg)
+(define-predicate (fixnum? si env arg)
+  (emit-expr si env arg)
   (emit "    and $~s, %al" fxmask)
   (emit "    cmp $~s, %al" fxtag)
   'EQ)
 
-(define-predicate ($fxzero? si arg)
-  (emit-expr si arg)
+(define-predicate ($fxzero? si env arg)
+  (emit-expr si env arg)
   (emit "    testl %eax, %eax")
   'EQ)
 
-(define-predicate (null? si arg)
-  (emit-expr si arg)
+(define-predicate (null? si env arg)
+  (emit-expr si env arg)
   (emit "    cmp $~s, %al" nullval)
   'EQ)
 
-(define-predicate (boolean? si arg)
-  (emit-expr si arg)
+(define-predicate (boolean? si env arg)
+  (emit-expr si env arg)
   (emit "    and $~s, %al" bool_mask)
   (emit "    cmp $~s, %al" bool_tag)
   'EQ)
 
-(define-predicate (char? si arg)
-  (emit-expr si arg)
+(define-predicate (char? si env arg)
+  (emit-expr si env arg)
   (emit "    and $~s, %al" charmask)
   (emit "    cmp $~s, %al" chartag)
   'EQ)
 
-(define-predicate (not si arg)
-  (emit-expr si arg)
+(define-predicate (not si env arg)
+  (emit-expr si env arg)
   (emit "    cmp $~s, %al" bool_f)
   'EQ)
 
-(define-primitive (fxlognot si arg)
-  (emit-expr si arg)
+(define-primitive (fxlognot si env arg)
+  (emit-expr si env arg)
   (emit "    notl %eax")
   (emit "    and $~s, %eax" (lognot fxmask)))
 
-(define-primitive (fx+ si arg1 arg2)
+(define-primitive (fx+ si env arg1 arg2)
   (define (out2)
-    (emit-expr si arg1)
+    (emit-expr si env arg1)
     (emit "    movl %eax, ~s(%esp)" si)
-    (emit-expr (- si wordsize) arg2)
+    (emit-expr (- si wordsize) env arg2)
     (emit "    addl ~s(%esp), %eax" si))
   (define (out1 expr const)
-    (emit-expr si expr)
+    (emit-expr si env expr)
     (emit "    addl $~s, %eax" (immediate-rep const)))
   ;; If two values are constant, they are convolved in much higher-place, so not processed here.
   (cond ((fixnum? arg2) (out1 arg1 arg2))
         ((fixnum? arg1) (out1 arg2 arg1))
         (else (out2))))
 
-(define-primitive (fx- si arg1 arg2)
+(define-primitive (fx- si env arg1 arg2)
   (define (out2)
-    (emit-expr si arg2)
+    (emit-expr si env arg2)
     (emit "    movl %eax, ~s(%esp)" si)
-    (emit-expr (- si wordsize) arg1)
+    (emit-expr (- si wordsize) env arg1)
     (emit "    subl ~s(%esp), %eax" si))
   (define (out1 expr const)
-    (emit-expr si expr)
+    (emit-expr si env expr)
     (emit "    subl $~s, %eax" (immediate-rep const)))
   (cond ((fixnum? arg2) (out1 arg1 arg2))
         (else (out2))))
 
-(define-primitive (fx* si arg1 arg2)
+(define-primitive (fx* si env arg1 arg2)
   (define (out2)
-    (emit-expr si arg1)
+    (emit-expr si env arg1)
     (emit "    sarl $2, %eax")  ; Shift to the right.
     (emit "    movl %eax, ~s(%esp)" si)
-    (emit-expr (- si wordsize) arg2)
+    (emit-expr (- si wordsize) env arg2)
     (emit "    imull ~s(%esp), %eax" si))
   (define (out1 expr const)
-    (emit-expr si expr)
+    (emit-expr si env expr)
     (emit "    imull $~s, %eax" const))  ; No shift needed.
   (cond ((fixnum? arg2) (out1 arg1 arg2))
         ((fixnum? arg1) (out1 arg2 arg1))
         (else (out2))))
 
-(define-primitive (fxlogor si arg1 arg2)
-  (emit-expr si arg1)
+(define-primitive (fxlogor si env arg1 arg2)
+  (emit-expr si env arg1)
   (emit "    movl %eax, ~s(%esp)" si)
-  (emit-expr (- si wordsize) arg2)
+  (emit-expr (- si wordsize) env arg2)
   (emit "    orl ~s(%esp), %eax" si))
 
-(define-primitive (fxlogand si arg1 arg2)
-  (emit-expr si arg1)
+(define-primitive (fxlogand si env arg1 arg2)
+  (emit-expr si env arg1)
   (emit "    movl %eax, ~s(%esp)" si)
-  (emit-expr (- si wordsize) arg2)
+  (emit-expr (- si wordsize) env arg2)
   (emit "    andl ~s(%esp), %eax" si))
 
-(define-predicate (fx= si arg1 arg2)
-  (emit-expr si arg1)
+(define-predicate (fx= si env arg1 arg2)
+  (emit-expr si env arg1)
   (emit "    movl %eax, ~s(%esp)" si)
-  (emit-expr (- si wordsize) arg2)
+  (emit-expr (- si wordsize) env arg2)
   (emit "    cmpl ~s(%esp), %eax" si)
   'EQ)
 
-(define-predicate (fx< si arg1 arg2)
-  (emit-expr si arg2)
+(define-predicate (fx< si env arg1 arg2)
+  (emit-expr si env arg2)
   (emit "    movl %eax, ~s(%esp)" si)
-  (emit-expr (- si wordsize) arg1)
+  (emit-expr (- si wordsize) env arg1)
   (emit "    cmpl ~s(%esp), %eax" si)
   'LT)
 
-(define-predicate (fx<= si arg1 arg2)
-  (emit-expr si arg2)
+(define-predicate (fx<= si env arg1 arg2)
+  (emit-expr si env arg2)
   (emit "    movl %eax, ~s(%esp)" si)
-  (emit-expr (- si wordsize) arg1)
+  (emit-expr (- si wordsize) env arg1)
   (emit "    cmpl ~s(%esp), %eax" si)
   'LE)
 
-(define-predicate (fx> si arg1 arg2)
-  (emit-expr si arg2)
+(define-predicate (fx> si env arg1 arg2)
+  (emit-expr si env arg2)
   (emit "    movl %eax, ~s(%esp)" si)
-  (emit-expr (- si wordsize) arg1)
+  (emit-expr (- si wordsize) env arg1)
   (emit "    cmpl ~s(%esp), %eax" si)
   'GT)
 
-(define-predicate (fx>= si arg1 arg2)
-  (emit-expr si arg2)
+(define-predicate (fx>= si env arg1 arg2)
+  (emit-expr si env arg2)
   (emit "    movl %eax, ~s(%esp)" si)
-  (emit-expr (- si wordsize) arg1)
+  (emit-expr (- si wordsize) env arg1)
   (emit "    cmpl ~s(%esp), %eax" si)
   'GE)
