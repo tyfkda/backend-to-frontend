@@ -28,9 +28,11 @@
   (emit "    movl %ecx, %esp")
   (emit "    ret")
 
-  (emit-label "L_scheme_entry")
-  (emit-expr (- wordsize) '() expr)
-  (emit "    ret"))
+  (cond ((letrec? expr) (emit-letrec expr))
+        (else
+         (emit-label "L_scheme_entry")
+         (emit-expr (- wordsize) '() expr)
+         (emit "    ret"))))
 
 (define (emit-function-header funcname)
   (emit "    .text")
@@ -47,6 +49,7 @@
    ((let? expr)       (emit-let si env expr))
    ((primcall? expr)  (emit-primcall si env expr))
    ((predicate-call? expr) (emit-predicate-val si env expr))
+   ((app? expr)       (emit-app si env expr))
    (else (error "not implemented"))))
 
 (define (emit-immediate x)
@@ -189,6 +192,56 @@
 (define (let-body expr)
   (caddr expr))
 
+(define (emit-letrec expr)
+  (let* ((bindings (letrec-bindings expr))
+         (lvars (map lhs bindings))
+         (lambdas (map rhs bindings))
+         (labels (unique-labels lvars))
+;         (labels (map symbol->string lvars))
+         (env (make-initial-env lvars labels)))
+    (for-each (emit-lambda env) lambdas labels)
+    (emit-label "L_scheme_entry")
+    (emit-scheme-entry (letrec-body expr) env)
+    (emit "    ret")))
+
+(define (emit-scheme-entry body env)
+  (emit-expr (- wordsize) env body))
+
+(define (emit-lambda env)
+  (lambda (expr label)
+    (emit-function-header label)
+    (let ((fmls (lambda-formals expr))
+          (body (lambda-body expr)))
+      (let f ((fmls fmls)
+              (si (- wordsize))
+              (env env))
+        (cond
+         ((empty? fmls)
+          (emit-expr si env body)
+          (emit "    ret"))
+         (else
+          (f (rest fmls)
+             (- si wordsize)
+             (extend-env (first fmls) si env))))))))
+
+(define (emit-app si env expr)
+  (define (emit-arguments si args)
+    (unless (empty? args)
+      (emit-expr si env (first args))
+      (emit "    movl %eax, ~s(%esp)" si)
+      (emit-arguments (- si wordsize) (rest args))))
+  (emit-arguments (- si wordsize) (call-args expr))
+  (emit-adjust-base (+ si wordsize))
+  (emit-call si (lookup (call-target expr) env))
+  (emit-adjust-base (- (+ si wordsize))))
+
+(define (emit-adjust-base n)
+  (cond ((< n 0) (emit "    subl $~a, %esp" (- n)))
+        ((> n 0) (emit "    addl $~a, %esp" n))))
+
+(define (emit-call si label)
+  (emit "    call ~a" label))
+
 (define empty? null?)
 (define first car)
 (define rest cdr)
@@ -254,6 +307,9 @@
         (set! count (add1 count))
         L))))
 
+(define (unique-labels expr)
+  (map (lambda (_) (unique-label)) expr))
+
 (define (if? expr)
   (and (pair? expr) (eq? (car expr) 'if)))
 
@@ -294,6 +350,33 @@
   (emit-expr si env arg)
   (emit "    shrl $~s, %eax" (- charshift fxshift)))
 
+(define (letrec? expr)
+  (and (pair? expr) (eq? (car expr) 'letrec)))
+
+(define (letrec-bindings expr)
+  (cadr expr))
+
+(define (letrec-body expr)
+  (caddr expr))
+
+(define (make-initial-env lvars labels)
+  (map cons lvars labels))
+
+(define (lambda-formals expr)
+  (cadr expr))
+
+(define (lambda-body expr)
+  (caddr expr))
+
+(define (app? expr)
+  (and (pair? expr)))
+
+(define (call-args expr)
+  (cdr expr))
+
+(define (call-target expr)
+  (car expr))
+
 (define (emit-to-boolean c)
   (let ((op (case c
               ((EQ)  "sete")
@@ -324,7 +407,7 @@
   (emit "    cmp $~s, %al" fxtag)
   'EQ)
 
-(define-predicate ($fxzero? si env arg)
+(define-predicate (fxzero? si env arg)
   (emit-expr si env arg)
   (emit "    testl %eax, %eax")
   'EQ)
@@ -416,11 +499,17 @@
   'EQ)
 
 (define-predicate (fx< si env arg1 arg2)
-  (emit-expr si env arg2)
-  (emit "    movl %eax, ~s(%esp)" si)
-  (emit-expr (- si wordsize) env arg1)
-  (emit "    cmpl ~s(%esp), %eax" si)
-  'LT)
+  (define (out2)
+    (emit-expr si env arg2)
+    (emit "    movl %eax, ~s(%esp)" si)
+    (emit-expr (- si wordsize) env arg1)
+    (emit "    cmpl ~s(%esp), %eax" si))
+  (define (out1 expr const)
+    (emit-expr si env expr)
+    (emit "    cmpl $~s, %eax" (immediate-rep const)))
+  (cond ((fixnum? arg2) (out1 arg1 arg2) 'LT)
+        ((fixnum? arg1) (out1 arg2 arg1) 'GT)
+        (else (out2) 'LT)))
 
 (define-predicate (fx<= si env arg1 arg2)
   (emit-expr si env arg2)
