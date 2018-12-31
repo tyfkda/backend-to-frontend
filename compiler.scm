@@ -31,7 +31,7 @@
   (cond ((letrec? expr) (emit-letrec expr))
         (else
          (emit-label "L_scheme_entry")
-         (emit-expr (- wordsize) '() expr)
+         (emit-tail-expr (- wordsize) '() expr)
          (emit "    ret"))))
 
 (define (emit-function-header funcname)
@@ -46,10 +46,23 @@
    ((if? expr)        (emit-if si env expr))
    ((and? expr)       (emit-and si env expr))
    ((or? expr)        (emit-or si env expr))
-   ((let? expr)       (emit-let si env expr))
+   ((let? expr)       (emit-let si env expr #f))
    ((primcall? expr)  (emit-primcall si env expr))
    ((predicate-call? expr) (emit-predicate-val si env expr))
    ((app? expr)       (emit-app si env expr))
+   (else (error "not implemented"))))
+
+(define (emit-tail-expr si env expr)
+  (cond
+   ((immediate? expr) (emit-tail-immediate expr))
+   ((variable? expr)  (emit-tail-variable-ref env expr))
+   ((if? expr)        (emit-tail-if si env expr))
+   ((and? expr)       (emit-and si env expr))
+   ((or? expr)        (emit-or si env expr))
+   ((let? expr)       (emit-tail-let si env expr))
+   ((primcall? expr)  (emit-tail-primcall si env expr))
+   ((predicate-call? expr) (emit-tail-predicate-val si env expr))
+   ((app? expr)       (emit-tail-app si env expr))
    (else (error "not implemented"))))
 
 (define (emit-immediate x)
@@ -101,7 +114,7 @@
     (emit-jump-if-not (emit-test si env (if-test expr))
                       alt-label)
     (emit-expr si env (if-conseq expr))
-    (emit "    jmp ~a" end-label)
+    (emit-jmp end-label)
     (emit-label alt-label)
     (emit-expr si env (if-altern expr))
     (emit-label end-label)))
@@ -127,7 +140,7 @@
                  (begin
                    (test-false (car p) false-label end-label)
                    (loop (cdr p)))))
-             (emit "    jmp ~a" end-label)
+             (emit-jmp end-label)
              (emit-label false-label)
              (emit "    mov $~s, %eax" bool_f)
              (emit-label end-label))))))
@@ -153,16 +166,19 @@
                  (begin
                    (test-true (car p) true-label end-label)
                    (loop (cdr p)))))
-             (emit "    jmp ~a" end-label)
+             (emit-jmp end-label)
              (emit-label true-label)
              (emit "    mov $~s, %eax" bool_t)
              (emit-label end-label))))))
 
-(define (emit-let si env expr)
+(define (emit-let si env expr tail?)
   (define (process-let bindings si new-env)
     (cond
      ((empty? bindings)
-      (emit-expr si new-env (let-body expr)))
+      ((if tail?
+           emit-tail-expr
+         emit-expr)
+       si new-env (let-body expr)))
      (else
       (let ((b (first bindings)))
         (emit-expr si env (rhs b))
@@ -201,11 +217,10 @@
          (env (make-initial-env lvars labels)))
     (for-each (emit-lambda env) lambdas labels)
     (emit-label "L_scheme_entry")
-    (emit-scheme-entry (letrec-body expr) env)
-    (emit "    ret")))
+    (emit-scheme-entry (letrec-body expr) env)))
 
 (define (emit-scheme-entry body env)
-  (emit-expr (- wordsize) env body))
+  (emit-tail-expr (- wordsize) env body))
 
 (define (emit-lambda env)
   (lambda (expr label)
@@ -217,8 +232,7 @@
               (env env))
         (cond
          ((empty? fmls)
-          (emit-expr si env body)
-          (emit "    ret"))
+          (emit-tail-expr si env body))
          (else
           (f (rest fmls)
              (- si wordsize)
@@ -232,8 +246,11 @@
       (emit-arguments (- si wordsize) (rest args))))
   (emit-arguments (- si wordsize) (call-args expr))
   (emit-adjust-base (+ si wordsize))
-  (emit-call si (lookup (call-target expr) env))
-  (emit-adjust-base (- (+ si wordsize))))
+  (let ((label (lookup (call-target expr) env)))
+    (unless label
+      (error "unbound variable:" (call-target expr)))
+    (emit-call si label)
+    (emit-adjust-base (- (+ si wordsize)))))
 
 (define (emit-adjust-base n)
   (cond ((< n 0) (emit "    subl $~a, %esp" (- n)))
@@ -259,6 +276,47 @@
     (if a
         (cdr a)
       #f)))
+
+(define (emit-tail-immediate x)
+  (emit-immediate x)
+  (emit "    ret"))
+(define (emit-tail-primcall si env expr)
+  (emit-primcall si env expr)
+  (emit "    ret"))
+(define emit-tail-predicate-val emit-predicate-val)
+(define (emit-tail-app si env expr)
+  (define (emit-arguments si args)
+    (unless (empty? args)
+      (emit-expr si env (first args))
+      (emit "    movl %eax, ~s(%esp)" si)
+      (emit-arguments (- si wordsize) (rest args))))
+  (emit-arguments si (call-args expr))
+  (emit-shift si (- wordsize) (length (call-args expr)))
+  (let ((label (lookup (call-target expr) env)))
+    (unless label
+      (error "unbound variable:" (call-target expr)))
+    (emit-jmp label)))
+(define (emit-shift from to argnum)
+  (when (> argnum 0)
+    (emit "    movl ~s(%esp), %eax" from)
+    (emit "    movl %eax, ~s(%esp)" to)
+    (emit-shift (- from wordsize) (- to wordsize) (- argnum 1))))
+(define (emit-jmp label)
+  (emit "    jmp ~a" label))
+(define (emit-tail-let si env expr) (emit-let si env expr #t))
+(define (emit-tail-variable-ref env var)
+  (emit-variable-ref env var)
+  (emit "    ret"))
+(define (emit-tail-if si env expr)
+  (let ((alt-label (unique-label))
+        (end-label (unique-label)))
+    (emit-jump-if-not (emit-test si env (if-test expr))
+                      alt-label)
+    (emit-tail-expr si env (if-conseq expr))
+    (emit-jmp end-label)
+    (emit-label alt-label)
+    (emit-tail-expr si env (if-altern expr))
+    (emit-label end-label)))
 
 (define (fixnum? x)
   (and (integer? x) (exact? x) (<= fxlower x fxupper)))
@@ -333,10 +391,16 @@
        (putprop 'prim-name '*emitter*
                 (lambda (si env arg* ...) b b* ...))))))
 
+(define-primitive (fxadd1 si env arg)
+  (emit-expr si env arg)
+  (emit "    addl $~s, %eax" (immediate-rep 1)))
 (define-primitive ($fxadd1 si env arg)
   (emit-expr si env arg)
   (emit "    addl $~s, %eax" (immediate-rep 1)))
 
+(define-primitive (fxsub1 si env arg)
+  (emit-expr si env arg)
+  (emit "    subl $~s, %eax" (immediate-rep 1)))
 (define-primitive ($fxsub1 si env arg)
   (emit-expr si env arg)
   (emit "    subl $~s, %eax" (immediate-rep 1)))
